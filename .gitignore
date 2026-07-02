@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated backtest results
+backtest_results/
+
+# Runtime data files
+candidates_*.txt
+dual_ma_gc_watchlist.txt
+*_result.json
+screen_results.json
+strategy_result.json
+
+# Debug
+debug_tencent.py
