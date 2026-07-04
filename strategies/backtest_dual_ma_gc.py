@@ -41,11 +41,12 @@ DEFAULT_CONFIG = {
     "max_mv": 1000,
     "min_total_shares": 0.5,
     "max_total_shares": 10,
-    "ma_short": 5,
-    "ma_long": 18,
-    "ma_stop": 18,       # MA for hard stop (MA18)
+    "ma_short": 10,
+    "ma_long": 30,
+    "ma_stop": 30,       # MA for hard stop (MA30)
+    "gc_lookback_days": 3,  # golden cross within last N days
     "top_n": 30,
-    "take_profit_mult": 1.3,   # price > buy_price * 1.05 2192 sell half
+    "take_profit_mult": 1.3,   # price > MA5 * 1.3 → sell half
     "stoploss_pct": 0.94,      # price < buy_price * 0.94 → sell all
     "kline_delay": 0.2,
 }
@@ -302,6 +303,8 @@ class DualMAGoldenCrossBacktester:
     def __init__(self, config: dict | None = None):
         self.cfg = {**DEFAULT_CONFIG, **(config or {})}
         self.fetcher = DataFetcher(self.cfg)
+        self._universe_cache: list[dict] = []
+        self._md_map_cache: dict[str, dict] = {}
 
     def fetch_universe(self) -> tuple[list[dict], dict[str, dict]]:
         log("▶ Fetching all A-share stocks from Sina...")
@@ -344,6 +347,7 @@ class DualMAGoldenCrossBacktester:
                 "code": code,
                 "name": name,
                 "mv": mv,
+                "total_shares": total_shares,
                 "amount": s.get("amount", 0),
                 "price": md.get("price", 0),
                 "changepercent": s.get("changepercent", 0),
@@ -354,6 +358,8 @@ class DualMAGoldenCrossBacktester:
         log(f"  Universe: {len(universe)} stocks (MV<={self.cfg['max_mv']}亿, shares {self.cfg['min_total_shares']}~{self.cfg['max_total_shares']}亿)")
 
         md_map = {s["code"]: s for s in universe}
+        self._universe_cache = universe
+        self._md_map_cache = md_map
         return universe, md_map
 
     def fetch_klines(self, universe: list[dict]) -> dict[str, list[dict]]:
@@ -384,48 +390,60 @@ class DualMAGoldenCrossBacktester:
         md_map: dict[str, dict],
         target_date: str,
     ) -> list[dict]:
-        """Run MA5上穿MA18 golden cross (no hot sector filter)."""
-        cfg = self.cfg
-        ma_s = cfg["ma_short"]
-        ma_l = cfg["ma_long"]
-        top_n = cfg["top_n"]
+        """Run via DualMAGoldenCross strategy class (v3: recent GC + quality scoring)."""
+        from strategies.base import StrategyContext
+        from strategies.builtins.dual_ma_gc import DualMAGoldenCross
 
-        picks = []
+        # Truncate klines to avoid look-ahead
+        truncated_klines: dict[str, list[dict]] = {}
         for code, klines in klines_data.items():
-            md = md_map.get(code)
-            if not md:
-                continue
-
             hist = get_kline_series(klines, target_date, lookback=120)
-            if hist is None or len(hist) < ma_l + 5:
-                continue
+            if hist and len(hist) >= 25:
+                truncated_klines[code] = hist
+            else:
+                truncated_klines[code] = []  # marker
 
-            closes = [d["close"] for d in hist]
-            n = len(closes)
+        # Build all_stocks with historical changepercent
+        all_stocks: list[dict] = []
+        for s in self._universe_cache:
+            code = s["code"]
+            hist = truncated_klines.get(code)
+            if hist and len(hist) >= 2:
+                prev_close = hist[-2]["close"]
+                curr_close = hist[-1]["close"]
+                hist_change = (
+                    (curr_close - prev_close) / prev_close * 100
+                    if prev_close > 0 else 0
+                )
+                s_with_hist = {**s, "changepercent": hist_change}
+            else:
+                s_with_hist = s
+            all_stocks.append(s_with_hist)
 
-            # Current MAs
-            c_ma_s = sum(closes[-ma_s:]) / ma_s
-            c_ma_l = sum(closes[-ma_l:]) / ma_l
+        context = StrategyContext(
+            all_stocks=all_stocks,
+            market_data=md_map,
+            klines=truncated_klines,
+            config={**self.cfg, "skip_market_check": True},
+            engine_config={**self.cfg, "kline_request_delay": 0},
+        )
 
-            # Previous MAs
-            ma_s_prev = sum(closes[-(ma_s + 1):-1]) / ma_s if n >= ma_s + 1 else c_ma_s
-            ma_l_prev = sum(closes[-(ma_l + 1):-1]) / ma_l if n >= ma_l + 1 else c_ma_l
+        strategy = DualMAGoldenCross()
+        picks = strategy.run(context)
 
-            # Strict golden cross: yesterday NO, today YES
-            if not (ma_s_prev <= ma_l_prev and c_ma_s > c_ma_l):
-                continue
-
-            picks.append({
-                "code": code,
-                "name": md.get("name", ""),
-                "close": closes[-1],
-                "mv": md.get("mv", 0),
-                "ma5": c_ma_s,
-                "ma18": c_ma_l,
+        # Map to backtest format
+        result = []
+        for pick in picks:
+            result.append({
+                "code": pick["code"],
+                "name": pick["name"],
+                "close": pick["price"],
+                "mv": pick["mv"],
+                "ma5": pick.get("ma5", 0),
+                "ma18": pick.get("ma18", 0),
+                "score": pick.get("score", 0),
             })
-
-        picks.sort(key=lambda x: x["mv"])  # small cap first
-        return picks[:top_n]
+        return result
 
     def check_sell_conditions(
         self,
@@ -445,7 +463,7 @@ class DualMAGoldenCrossBacktester:
         ma5 = calc_ma(closes, self.cfg["ma_short"])
         ma18 = calc_ma(closes, self.cfg["ma_stop"])
 
-        if ma10 <= 0 or ma18 <= 0:
+        if ma5 <= 0 or ma18 <= 0:
             return False
 
         buy_price = position.buy_price
@@ -488,6 +506,20 @@ class DualMAGoldenCrossBacktester:
             log("ERROR: No kline data, cannot backtest.")
             return result
 
+        # 2b. Fetch CSI All-Share index klines for market state
+        index_code = "399985"
+        idx_prefix = code_to_prefix(index_code)
+        if idx_prefix:
+            idx_sym = f"{idx_prefix}{index_code}"
+            idx_klines = fetch_kline_with_dates(idx_sym, self.cfg)
+            if idx_klines and len(idx_klines) >= 60:
+                klines_data[index_code] = idx_klines
+                log(f"  Index klines (399985): {len(idx_klines)} days")
+            else:
+                log("  WARN: No index klines, market filter disabled")
+        else:
+            log("  WARN: Invalid index code, market filter disabled")
+
         # 3. Build date axis
         all_dates = build_common_dates(klines_data)
         log(f"  Total unique trading days: {len(all_dates)}")
@@ -516,7 +548,27 @@ class DualMAGoldenCrossBacktester:
         # Build a date-to-index map for quick lookup
         date_to_idx = {d: i for i, d in enumerate(backtest_dates)}
 
+        # ── Market state check helper ──────────────────────
+        def is_bear_market(date: str) -> bool:
+            idx_kd = klines_data.get(index_code) if idx_prefix else None
+            if not idx_kd or len(idx_kd) < 25:
+                return False
+            hist = get_kline_series(idx_kd, date, lookback=30)
+            if hist is None or len(hist) < 22:
+                return False
+            h_closes = [d["close"] for d in hist]
+            h_ma20 = sum(h_closes[-20:]) / 20
+            return h_closes[-1] < h_ma20
+
+        skipped_rebalances = 0
+
         for ri, buy_date in enumerate(rebalance_dates):
+            # ── Market filter: skip rebalance in bear market ────────
+            if idx_prefix and is_bear_market(buy_date):
+                log(f"  [SKIP] {buy_date}: bear market (index < MA20)")
+                skipped_rebalances += 1
+                continue
+
             # ── Buy signals ─────────────────────────────────────────
             picks = self.run_strategy_at_date(klines_data, md_map, buy_date)
             if picks:
@@ -571,6 +623,12 @@ class DualMAGoldenCrossBacktester:
 
         result.trades = all_trades
         result.compute()
+
+        if skipped_rebalances > 0:
+            total = len(rebalance_dates)
+            log(f"  Market filter: skipped {skipped_rebalances}/{total} "
+                f"rebalances ({skipped_rebalances*100//total}% bear market)")
+
         return result
 
 

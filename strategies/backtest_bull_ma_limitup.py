@@ -464,7 +464,7 @@ class BullMALimitUpBacktester:
         ma5 = calc_ma(closes, self.cfg["ma_short"])
         ma18 = calc_ma(closes, self.cfg["ma_stop"])
 
-        if ma10 <= 0 or ma18 <= 0:
+        if ma5 <= 0 or ma18 <= 0:
             return False
 
         buy_price = position.buy_price
