@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
     "ma_long": 18,
     "ma_stop": 18,
     "top_n": 30,
-    "take_profit_mult": 1.3,
+    "take_profit_mult": 1.3,   # price > buy_price * 1.05 2192 sell half
     "stoploss_pct": 0.94,
     "lookback_days": 20,
     "surge_threshold": 8.0,
@@ -464,7 +464,7 @@ class BullMALimitUpBacktester:
         ma5 = calc_ma(closes, self.cfg["ma_short"])
         ma18 = calc_ma(closes, self.cfg["ma_stop"])
 
-        if ma5 <= 0 or ma18 <= 0:
+        if ma10 <= 0 or ma18 <= 0:
             return False
 
         buy_price = position.buy_price

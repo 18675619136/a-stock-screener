@@ -16,7 +16,7 @@ from typing import Any
 
 from strategies.base import StrategyBase, StrategyContext
 from strategies.registry import register_strategy
-from strategies.data.fetcher import log, code_to_prefix
+from strategies.data.fetcher import log, code_to_prefix, match_stock_to_hot_sector, DataFetcher
 
 
 @register_strategy
@@ -89,7 +89,6 @@ class DualMAGoldenCross(StrategyBase):
 
             kd = context.get_kline(code)
             if kd is None:
-                from strategies.data.fetcher import DataFetcher
                 fetcher = DataFetcher(context.engine_config)
                 sym = f"{prefix}{code}"
                 kd = fetcher.get_kline(sym)
@@ -137,8 +136,26 @@ class DualMAGoldenCross(StrategyBase):
             if delay > 0 and (i + 1) % 30 != 0:
                 time.sleep(delay)
 
-        # ── Step 4: Sort — small cap first ────────────
-        gc_stocks.sort(key=lambda x: x["mv"])
+        # ── Step 4: Sort by hot sector strength ────────
+        if gc_stocks:
+            fetcher = DataFetcher(context.engine_config)
+            hot_sectors = fetcher.fetch_hot_sectors_with_strength(top_k=30)
+            if hot_sectors:
+                top5 = ", ".join(s["name"] for s in hot_sectors[:5])
+                log(f"  Hot sectors (by 涨跌比): {top5}...")
+                for s in gc_stocks:
+                    sec_name, sec_strength = match_stock_to_hot_sector(
+                        s["name"], hot_sectors
+                    )
+                    s["sector"] = sec_name
+                    s["sector_strength"] = sec_strength
+                # Sort: sector strength desc, then mv asc within same sector
+                gc_stocks.sort(key=lambda x: (-x["sector_strength"], x["mv"]))
+                matched = sum(1 for s in gc_stocks if s["sector_strength"] > 0)
+                log(f"  Sector-matched: {matched}/{len(gc_stocks)} stocks")
+            else:
+                log("  Failed to fetch hot sectors, falling back to mv sort")
+                gc_stocks.sort(key=lambda x: x["mv"])
         gc_stocks = gc_stocks[:top_n]
 
         log(f"  Final selections: {len(gc_stocks)} stocks")

@@ -69,21 +69,21 @@ SECTOR_NAMES = {
 }
 
 TRACK_KW = [
-    ("半导体/芯片", ["半导体", "芯片", "微电", "集成电路", "晶圆", "封装", "光刻", "存储", "GPU", "AI芯片"]),
+    ("半导体/芯片", ["半导体", "芯片", "微电", "集成电路", "晶圆", "封装", "光刻", "存储", "GPU", "AI芯片", "中芯", "华创", "华大"]),
     ("创新药/医药", ["创新药", "生物", "医药", "恒瑞", "百济", "药明", "凯莱英", "基因", "医疗", "制药", "药"]),
-    ("AI/人工智能", ["AI", "人工智能", "大模型", "智能体", "视觉", "语音", "讯飞", "拓尔思", "云从", "算法"]),
+    ("AI/人工智能", ["AI", "人工智能", "大模型", "智能体", "视觉", "语音", "讯飞", "拓尔思", "云从", "算法", "软件"]),
     ("人形机器人", ["机器人", "绿的谐波", "减速器", "丝杠", "执行器", "灵巧手", "伺服", "电机"]),
     ("低空经济", ["低空", "无人机", "eVTOL", "飞行汽车", "空管", "通航"]),
     ("智能驾驶", ["自动驾驶", "无人驾驶", "激光雷达", "ADAS", "域控制器", "智驾"]),
-    ("军工/国防", ["军工", "航天", "航空", "北斗", "卫星", "中航", "雷达", "国防", "船舶"]),
+    ("军工/国防", ["军工", "航天", "航空", "北斗", "卫星", "中航", "雷达", "国防", "船舶", "航发", "沈飞", "中兵", "电科"]),
     ("新能源/储能", ["新能源", "光伏", "储能", "电池", "宁德", "锂电", "逆变器", "固态电池", "风电", "氢能"]),
     ("通信/算力", ["通信", "光通信", "光模块", "算力", "服务器", "数据中心", "IDC", "5G", "6G", "光纤"]),
     ("金融", ["证券", "银行", "保险", "中信", "招商", "兴业", "平安", "金融"]),
-    ("新材料", ["有色", "金属", "钨", "锂", "钴", "镍", "稀土", "石英", "材料", "化工"]),
-    ("消费", ["消费", "家电", "白酒", "食品", "饮料", "茅台", "五粮液", "伊利", "乳业", "零售"]),
+    ("新材料", ["有色", "金属", "钨", "锂", "钴", "镍", "稀土", "石英", "材料", "化工", "化学", "化纤"]),
+    ("消费", ["消费", "家电", "白酒", "食品", "饮料", "茅台", "五粮液", "伊利", "乳业", "零售", "美的", "格力", "海尔"]),
     ("电力/公用", ["电力", "水电", "风电", "核电", "电网", "能源", "燃气", "水务", "环保"]),
     ("传媒/游戏", ["传媒", "游戏", "影视", "广告", "直播", "短剧", "动漫", "文化"]),
-    ("地产/基建", ["地产", "基建", "房地产", "万科", "保利", "建筑", "中铁", "中交"]),
+    ("地产/基建", ["地产", "基建", "房地产", "万科", "保利", "建筑", "中铁", "中交", "交建", "路桥"]),
     ("其他", []),
 ]
 
@@ -136,6 +136,105 @@ def match_track(name: str) -> str:
             if kw in name:
                 return tn
     return "其他"
+
+
+# ── Sector keywords extraction ──────────────────────────────────
+
+_SECTOR_SUFFIXES = ("概念", "板块", "行业", "指数", "主题", "板块")
+
+
+def _sector_keywords(name: str) -> list[str]:
+    """Generate search keywords from a hot sector name for stock name matching.
+
+    Examples:
+        '工程建设'  -> ['工程建设', '工程', '建设']
+        '半导体'    -> ['半导体', '半导']
+        '酿酒概念'  -> ['酿酒', '酒']
+        'AI人工智能' -> ['AI人工智能', 'AI']
+    """
+    cleaned = name
+    for suffix in _SECTOR_SUFFIXES:
+        cleaned = cleaned.replace(suffix, "")
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return []
+
+    keywords = {cleaned}  # whole cleaned name
+    # 2-char segments for longer names
+    if len(cleaned) >= 4:
+        keywords.add(cleaned[:2])
+        keywords.add(cleaned[2:4])
+    if len(cleaned) == 3:
+        keywords.add(cleaned[:2])
+    return [k for k in keywords if k]
+
+
+# ── TRACK_KW category to hot sector name cross-reference ─────────
+# Maps TRACK_KW categories -> possible East Money hot sector name keywords.
+# Used as Layer 2 fallback when direct stock name matching fails.
+TRACK_TO_SECTOR_TERMS: dict[str, list[str]] = {
+    "半导体/芯片": ["半导体", "芯片", "集成电路", "电子"],
+    "创新药/医药": ["医药", "生物", "医疗", "创新药", "中药"],
+    "AI/人工智能": ["人工智能", "AI", "软件", "互联网", "大数据", "算力", "信创"],
+    "人形机器人": ["机器人", "自动化", "机器"],
+    "低空经济": ["低空", "航空", "无人机", "飞行"],
+    "智能驾驶": ["汽车", "智能驾驶", "无人驾驶", "汽配", "新能源车"],
+    "军工/国防": ["军工", "国防", "航天", "船舶", "航空"],
+    "新能源/储能": ["新能源", "光伏", "储能", "电池", "风电", "氢能", "能源", "锂电"],
+    "通信/算力": ["通信", "算力", "5G", "光通信", "光纤", "服务器", "数据中心"],
+    "金融": ["金融", "证券", "银行", "保险", "券商"],
+    "新材料": ["有色", "钢铁", "材料", "化工", "稀土", "金属", "化纤", "钨", "锂"],
+    "消费": ["白酒", "消费", "食品", "家电", "酿酒", "饮料", "旅游", "乳业"],
+    "电力/公用": ["电力", "能源", "环保", "水务", "燃气", "核电", "电网"],
+    "传媒/游戏": ["传媒", "游戏", "影视", "文化", "广告", "短剧", "动漫"],
+    "地产/基建": ["地产", "基建", "房地产", "工程", "建设", "建筑", "水泥"],
+}
+
+
+def match_stock_to_hot_sector(
+    stock_name: str, hot_sectors: list[dict],
+) -> tuple[str, float]:
+    """Match a stock name to the best hot sector by name matching.
+
+    Two-layer matching:
+      1. Direct: check stock name against sector name keywords
+         (e.g. '中芯国际' contains '芯' -> '半导体')
+      2. Track-based: use match_track() to categorize stock, then
+         cross-reference the track name against hot sector names via
+         TRACK_TO_SECTOR_TERMS mapping
+
+    Args:
+        stock_name: stock name like '中国建筑'
+        hot_sectors: list of {name, strength, ...}
+
+    Returns:
+        (sector_name, strength), or ("其他", 0.0) if no match
+    """
+    if not stock_name or not hot_sectors:
+        return ("其他", 0.0)
+
+    # Layer 1: Direct keyword matching (stock name ↔ sector name keywords)
+    for sector in hot_sectors:
+        for kw in _sector_keywords(sector["name"]):
+            if kw and kw in stock_name:
+                return (sector["name"], sector["strength"])
+
+    # Layer 2: Track-based matching
+    track = match_track(stock_name)
+    if track == "其他":
+        return ("其他", 0.0)
+
+    search_terms = TRACK_TO_SECTOR_TERMS.get(track, [])
+    if not search_terms:
+        return ("其他", 0.0)
+
+    for sector in hot_sectors:
+        sec_name = sector["name"]
+        for term in search_terms:
+            if term in sec_name or sec_name in term:
+                return (sector["name"], sector["strength"])
+
+    return ("其他", 0.0)
 
 
 class DataFetcher:
@@ -327,13 +426,27 @@ class DataFetcher:
         Returns list of hot sector names (e.g. ['军工', '新能源', '半导体']).
         Falls back to empty list on failure.
         """
+        sectors = self.fetch_hot_sectors_with_strength(top_k=top_k)
+        return [s["name"] for s in sectors]
+
+    def fetch_hot_sectors_with_strength(self, top_k: int = 30) -> list[dict]:
+        """Fetch hot concept sectors ranked by 涨跌比 (up/down ratio).
+
+        Steps:
+          1. Fetch concept sectors from East Money.
+          2. Filter to hot sectors (top N by 5-day change %).
+          3. Rank those hot sectors by internal 涨跌比 = 上涨家数/下跌家数.
+
+        Returns list of dicts:
+            {name, bk_code, strength, up, down, change_5d}
+        sorted by strength descending. Empty list on failure.
+        """
         url = (
             "https://push2.eastmoney.com/api/qt/clist/get?"
-            f"fs=m:90+t:3&fields=f12,f14,f2,f3,f104,f109"
-            f"&pn=1&np=1&pz={top_k + 5}"
+            f"fs=m:90+t:3&fields=f12,f14,f104,f105,f106"
+            f"&pn=1&np=1&pz={top_k + 10}"
         )
         try:
-            import urllib.request
             req = urllib.request.Request(
                 url,
                 headers={
@@ -347,13 +460,33 @@ class DataFetcher:
             items = parsed.get("data", {}).get("diff", [])
             if not items:
                 return []
-            # Sort by f104 (5-day change %) descending
-            items.sort(key=lambda x: float(x.get("f104", 0) or 0), reverse=True)
-            names = []
-            for item in items[:top_k]:
-                name = str(item.get("f14", "")).strip()
-                if name and name not in ("其他", ""):
-                    names.append(name)
-            return names
+
+            # Build list with calculated 涨跌比
+            active = []
+            for item in items:
+                up = int(item.get("f105", 0) or 0)
+                down = int(item.get("f106", 0) or 0)
+                if up + down == 0:
+                    continue
+                strength = up / max(down, 1)
+                active.append({
+                    "name": str(item.get("f14", "")).strip(),
+                    "bk_code": str(item.get("f12", "")),
+                    "strength": round(strength, 2),
+                    "up": up,
+                    "down": down,
+                    "change_5d": float(item.get("f104", 0) or 0),
+                })
+
+            if not active:
+                return []
+
+            # Sort by 5-day change to find hot sectors
+            active.sort(key=lambda x: x["change_5d"], reverse=True)
+            hot = active[:top_k]
+
+            # Re-sort hot sectors by 涨跌比 (strength) descending
+            hot.sort(key=lambda x: x["strength"], reverse=True)
+            return hot
         except Exception:
             return []

@@ -307,6 +307,8 @@ class MomentumMABacktester:
     def __init__(self, config: dict | None = None):
         self.cfg = {**DEFAULT_CONFIG, **(config or {})}
         self.fetcher = DataFetcher(self.cfg)
+        self._universe_cache: list[dict] = []
+        self._md_map_cache: dict[str, dict] = {}
 
     def fetch_universe(self) -> tuple[list[dict], dict[str, dict]]:
         log("▶ Fetching all A-share stocks from Sina...")
@@ -358,6 +360,8 @@ class MomentumMABacktester:
         log(f"  Universe: {len(universe)} stocks (MV<={self.cfg['max_mv']}亿, shares {self.cfg['min_total_shares']}~{self.cfg['max_total_shares']}亿)")
 
         md_map = {s["code"]: s for s in universe}
+        self._universe_cache = universe
+        self._md_map_cache = md_map
         return universe, md_map
 
     def fetch_klines(self, universe: list[dict]) -> dict[str, list[dict]]:
@@ -388,94 +392,62 @@ class MomentumMABacktester:
         md_map: dict[str, dict],
         target_date: str,
     ) -> list[dict]:
-        """Run CLOSE > MA5 > MA18 + volume screening at a given date."""
-        cfg = self.cfg
-        enable_vol = cfg.get("enable_volume_filter", True)
-        min_vol_ratio = cfg.get("volume_surge_ratio", 1.2)
-        max_mv = float(cfg["max_mv"])
-        top_n = cfg["top_n"]
+        """Run strategy via MomentumMAStrategy class (includes sector scoring + market timing)."""
+        from strategies.base import StrategyContext
+        from strategies.builtins.momentum_ma import MomentumMAStrategy
 
-        picks = []
-
+        # Truncate klines to target_date to avoid look-ahead bias.
+        # Set empty list for codes without enough history so the strategy
+        # won't try to fetch live data from the API.
+        truncated_klines: dict[str, list[dict]] = {}
         for code, klines in klines_data.items():
-            md = md_map.get(code)
-            if not md:
-                continue
-
             hist = get_kline_series(klines, target_date, lookback=120)
-            if hist is None or len(hist) < 25:
-                continue
-
-            closes = [d["close"] for d in hist]
-            volumes = [d.get("volume", 0) for d in hist]
-            close = closes[-1]
-
-            # MA calculation
-            ma5 = sum(closes[-5:]) / 5
-            ma18 = sum(closes[-18:]) / 18
-
-            # Condition 1: CLOSE > MA5 > MA18
-            if not (close > ma5 > ma18):
-                continue
-
-            # Condition 2: Volume > 18-day avg × 1.2
-            if enable_vol and len(volumes) >= 19:
-                recent_vol = volumes[-1]
-                avg_vol = sum(volumes[-19:-1]) / 18 if sum(volumes[-19:-1]) > 0 else 1
-                vol_ratio = recent_vol / avg_vol if avg_vol > 0 else 1.0
-                if vol_ratio < min_vol_ratio:
-                    continue
-                vol_surge = min(vol_ratio / 3.0, 1.0)
+            if hist and len(hist) >= 25:
+                truncated_klines[code] = hist
             else:
-                vol_surge = 1.0
+                truncated_klines[code] = []  # marker: no data
 
-            # Score for ranking
-            score = 0.0
-
-            # Momentum
-            prev_close = closes[-2] if len(closes) >= 2 else close
-            change_pct = (close - prev_close) / prev_close * 100 if prev_close > 0 else 0
-            mom_score = min(max(change_pct, -10), 10) / 10.0
-            score += 0.30 * mom_score
-
-            # MA alignment
-            if ma18 > 0:
-                ma_align = (close - ma18) / ma18
-                ma_score = min(max(ma_align * 3, 0), 1.0)
-                score += 0.25 * ma_score
-
-            # Volume
-            score += 0.15 * vol_surge
-
-            # Small cap bonus
-            mv = md.get("mv", 100)
-            mv_norm = 1.0 - (mv / max_mv) if max_mv > 0 else 0.5
-            score += 0.20 * max(0, mv_norm)
-
-            # Price position
-            recent_high = max(closes[-18:])
-            recent_low = min(closes[-18:])
-            price_range = recent_high - recent_low
-            if price_range > 0:
-                pos = (close - recent_low) / price_range
-                pos_score = 1.0 - abs(pos - 0.35) * 1.8
-                pos_score = max(0, min(1.0, pos_score))
+        # Build all_stocks with historical changepercent from klines
+        all_stocks: list[dict] = []
+        for s in self._universe_cache:
+            code = s["code"]
+            hist = truncated_klines.get(code)
+            if hist and len(hist) >= 2:
+                prev_close = hist[-2]["close"]
+                curr_close = hist[-1]["close"]
+                hist_change = (
+                    (curr_close - prev_close) / prev_close * 100
+                    if prev_close > 0 else 0
+                )
+                s_with_hist = {**s, "changepercent": hist_change}
             else:
-                pos_score = 0.5
-            score += 0.10 * pos_score
+                s_with_hist = s  # fallback
+            all_stocks.append(s_with_hist)
 
-            picks.append({
-                "code": code,
-                "name": md.get("name", ""),
-                "close": close,
-                "mv": mv,
-                "ma5": ma5,
-                "ma18": ma18,
-                "score": score,
+        context = StrategyContext(
+            all_stocks=all_stocks,
+            market_data=md_map,
+            klines=truncated_klines,
+            config={**self.cfg, "skip_market_check": True},
+            engine_config={**self.cfg, "kline_request_delay": 0},
+        )
+
+        strategy = MomentumMAStrategy()
+        picks = strategy.run(context)
+
+        # Map strategy output format (price→close) for backtest consumption
+        result = []
+        for pick in picks:
+            result.append({
+                "code": pick["code"],
+                "name": pick["name"],
+                "close": pick["price"],
+                "mv": pick["mv"],
+                "ma5": pick["ma5"],
+                "ma18": pick["ma18"],
+                "score": pick["score"],
             })
-
-        picks.sort(key=lambda x: x["score"], reverse=True)
-        return picks[:top_n]
+        return result
 
     def check_sell_conditions(
         self,
@@ -545,6 +517,20 @@ class MomentumMABacktester:
             log("ERROR: No kline data, cannot backtest.")
             return result
 
+        # 2b. Fetch CSI All-Share index klines for market state
+        index_code = "399985"
+        idx_prefix = code_to_prefix(index_code)
+        if idx_prefix:
+            idx_sym = f"{idx_prefix}{index_code}"
+            idx_klines = fetch_kline_with_dates(idx_sym, self.cfg)
+            if idx_klines and len(idx_klines) >= 60:
+                klines_data[index_code] = idx_klines
+                log(f"  Index klines (399985): {len(idx_klines)} days")
+            else:
+                log("  WARN: No index klines, market filter disabled")
+        else:
+            log("  WARN: Invalid index code, market filter disabled")
+
         # 3. Build date axis
         all_dates = build_common_dates(klines_data)
         log(f"  Total unique trading days: {len(all_dates)}")
@@ -572,7 +558,29 @@ class MomentumMABacktester:
 
         date_to_idx = {d: i for i, d in enumerate(backtest_dates)}
 
+        # ── Market state check helper ──────────────────────
+        def is_bear_market(date: str) -> bool:
+            """Check if CSI All-Share is below MA20 on the given date."""
+            idx_kd = klines_data.get(index_code) if idx_prefix else None
+            if not idx_kd or len(idx_kd) < 25:
+                return False
+            hist = get_kline_series(idx_kd, date, lookback=30)
+            if hist is None or len(hist) < 22:
+                return False
+            h_closes = [d["close"] for d in hist]
+            h_ma20 = sum(h_closes[-20:]) / 20
+            return h_closes[-1] < h_ma20
+
+        # Track skipped count
+        skipped_rebalances = 0
+
         for ri, buy_date in enumerate(rebalance_dates):
+            # ── Market filter: skip rebalance in bear market ────────
+            if idx_prefix and is_bear_market(buy_date):
+                log(f"  [SKIP] {buy_date}: bear market (index < MA20)")
+                skipped_rebalances += 1
+                continue
+
             # ── Buy signals ─────────────────────────────────────────
             picks = self.run_strategy_at_date(klines_data, md_map, buy_date)
             if picks:
@@ -625,6 +633,12 @@ class MomentumMABacktester:
 
         result.trades = all_trades
         result.compute()
+
+        if skipped_rebalances > 0:
+            total = len(rebalance_dates)
+            log(f"  Market filter: skipped {skipped_rebalances}/{total} "
+                f"rebalances ({skipped_rebalances*100//total}% bear market)")
+
         return result
 
 

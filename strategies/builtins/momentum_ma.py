@@ -19,7 +19,7 @@ from typing import Any
 
 from strategies.base import StrategyBase, StrategyContext
 from strategies.registry import register_strategy
-from strategies.data.fetcher import log, code_to_prefix, safe_float
+from strategies.data.fetcher import log, code_to_prefix, safe_float, match_stock_to_hot_sector, DataFetcher
 
 
 @register_strategy
@@ -28,7 +28,7 @@ class MomentumMAStrategy(StrategyBase):
     display_name = "多因子动量 v2"
     description = (
         "动量v2 — CLOSE>MA5>MA18 + 18日均量×1.2放量 + "
-        "市值<1000亿 + 总股本0.5~10亿"
+        "市值<1000亿 + 总股本0.5~10亿 + 赛道涨跌比分"
     )
 
     def run(self, context: StrategyContext) -> list[dict[str, Any]]:
@@ -86,6 +86,49 @@ class MomentumMAStrategy(StrategyBase):
         check_list = candidates[:kline_limit]
         log(f"  Fetching klines for top {len(check_list)} candidates...")
 
+        # ── Fetch hot sectors for scoring boost (class-level cache, shared across rebalances) ──
+        hot_sectors = getattr(MomentumMAStrategy, "_hot_sectors_cache", None)
+        if hot_sectors is None:
+            hot_sectors = []
+            try:
+                sector_fetcher = DataFetcher(context.engine_config)
+                hot_sectors = sector_fetcher.fetch_hot_sectors_with_strength(top_k=30)
+                if hot_sectors:
+                    top5 = ", ".join(s["name"] for s in hot_sectors[:5])
+                    log(f"  Hot sectors (by 涨跌比): {top5}...")
+            except Exception:
+                hot_sectors = []
+            MomentumMAStrategy._hot_sectors_cache = hot_sectors
+
+        # ── Market state check (CSI All-Share index MA20) ────────
+        market_bear = False
+        # Skip if backtest mode (market filter handled by the backtest engine)
+        if not cfg.get("skip_market_check", False):
+            try:
+                index_code = "399985"
+                idx_prefix = code_to_prefix(index_code)
+                if idx_prefix:
+                    idx_sym = f"{idx_prefix}{index_code}"
+                    mkt_fetcher = DataFetcher(context.engine_config)
+                    idx_kd = mkt_fetcher.get_kline(idx_sym)
+                    if idx_kd and len(idx_kd) >= 25:
+                        idx_closes = [d["close"] for d in idx_kd]
+                        idx_close = idx_closes[-1]
+                        idx_ma20 = sum(idx_closes[-20:]) / 20
+                        above_pct = (idx_close - idx_ma20) / idx_ma20 * 100
+                        market_bear = idx_close < idx_ma20
+                        log(f"  Market: CSI All-Share={idx_close:.0f}, MA20={idx_ma20:.0f}, "
+                            f"{'BEAR' if market_bear else 'BULL'} (+{above_pct:.1f}% above MA20)"
+                            if above_pct > 0 else
+                            f"{'BEAR' if market_bear else 'BULL'} ({above_pct:.1f}% below MA20)")
+            except Exception as e:
+                log(f"  Market check skipped: {e}")
+
+        if market_bear:
+            old_top = top_n
+            top_n = max(top_n // 2, 5)
+            log(f"  Bear market mode: top_n {old_top} → {top_n}")
+
         # ── Step 3: Kline analysis — CLOSE > MA5 > MA18 + volume ─────
         final = []
         for i, c in enumerate(check_list):
@@ -98,7 +141,6 @@ class MomentumMAStrategy(StrategyBase):
             if kd is None:
                 fetcher = getattr(self, "_fetcher", None)
                 if fetcher is None:
-                    from strategies.data.fetcher import DataFetcher
                     fetcher = DataFetcher(context.engine_config)
                     self._fetcher = fetcher
                 sym = f"{prefix}{code}"
@@ -145,14 +187,14 @@ class MomentumMAStrategy(StrategyBase):
             if ma18 > 0:
                 ma_align = (close - ma18) / ma18
                 ma_score = min(max(ma_align * 3, 0), 1.0)
-                score += 0.25 * ma_score
+                score += 0.20 * ma_score
 
             # Volume surge
-            score += 0.15 * vol_surge
+            score += 0.10 * vol_surge
 
             # Small cap bonus
             mv_norm = 1.0 - (c["mv"] / max_mv) if max_mv > 0 else 0.5
-            score += 0.20 * max(0, mv_norm)
+            score += 0.15 * max(0, mv_norm)
 
             # Price position: prefer stocks between 15%-50% of 18-day range
             recent_high = max(closes[-18:])
@@ -164,7 +206,14 @@ class MomentumMAStrategy(StrategyBase):
                 pos_score = max(0, min(1.0, pos_score))
             else:
                 pos_score = 0.5
-            score += 0.10 * pos_score
+            score += 0.05 * pos_score
+
+            # Sector strength: hot sector 涨跌比 boost
+            sector_name, sector_strength = match_stock_to_hot_sector(
+                c["name"], hot_sectors
+            ) if hot_sectors else ("其他", 0.0)
+            sec_score = min(sector_strength / 10.0, 1.0)
+            score += 0.20 * sec_score
 
             final.append({
                 "code": code,
@@ -178,6 +227,8 @@ class MomentumMAStrategy(StrategyBase):
                 "above_ma18_pct": round((close - ma18) / ma18 * 100, 2),
                 "score": round(score, 4),
                 "volume_ratio": round(vol_ratio, 2),
+                "sector": sector_name,
+                "sector_strength": sector_strength,
             })
 
             if (i + 1) % 30 == 0:
