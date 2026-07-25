@@ -32,7 +32,7 @@ SINA_ALL_URL = (
 
 TENCENT_MV_URL = "https://qt.gtimg.cn/q={syms}"
 TENCENT_KLINE_URL = (
-    "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,500,qfq"
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,500,qfq"
 )
 
 SECTOR_INDICES = [
@@ -118,7 +118,9 @@ def strip_prefix(sym: str) -> str:
 
 def code_to_prefix(code: str) -> str:
     """Map stock code to exchange prefix."""
-    if code.startswith(("6", "9", "68")):
+    if code.startswith("92"):
+        return "bj"
+    elif code.startswith(("6", "9", "68")):
         return "sh"
     elif code.startswith(("0", "3")):
         return "sz"
@@ -321,8 +323,8 @@ class DataFetcher:
                                 "code": code,
                                 "name": parts[1],
                                 "price": safe_float(parts[3]),
-                                "mv": safe_float(parts[46]),          # 总市值（亿）
-                                "total_shares": safe_float(parts[46]) / safe_float(parts[3]) if safe_float(parts[3]) > 0 else 0,  # 总股本（亿股）= 总市值/价格
+                                "mv": safe_float(parts[44]),          # 总市值（亿） — parts[44]=总市值, parts[43]=振幅%, parts[46]=市净率PB
+                                "total_shares": safe_float(parts[44]) / safe_float(parts[3]) if safe_float(parts[3]) > 0 else 0,  # 总股本（亿股）= 总市值/价格
                                 "changepercent": safe_float(parts[32]) if len(parts) > 32 else 0,
                                 "amount": safe_float(parts[37]) if len(parts) > 37 else 0,
                             }
@@ -348,7 +350,7 @@ class DataFetcher:
         Returns:
             List of {close, volume, high, low, open} for recent N days, or None.
         """
-        url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,500,qfq"
+        url = f"https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,500,qfq"
         for attempt in range(2):
             raw = fetch_url(url, headers=TENCENT_HEADERS,
                             timeout=self.config.get("timeout_kline", 10))

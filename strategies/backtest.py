@@ -53,7 +53,45 @@ DEFAULT_CONFIG = {
 }
 
 COST = 0.001
+
+# ── Long upper shadow sell ──
+# 当日最高价 ≥ 收盘价 × N 倍时（长上影线），卖出六成
+PEAK_TP_PCT = 1.15
 ST_NAME_PREFIXES = ("ST", "*ST", "S")
+
+# ── 涨停/跌停辅助函数 ──
+def get_limit_pct(code: str) -> float:
+    """返回涨跌幅限制比例"""
+    if code.startswith(("300", "688")):
+        return 0.20  # 创业板/科创板 20%
+    elif code.startswith(("8", "4", "92")):
+        return 0.30  # 北交所 30%
+    else:
+        return 0.10  # 主板 10%
+
+def is_limit_up_from_klines(klines: list[dict], date: str, code: str) -> bool:
+    """Check if the stock was at 涨停 on the given date, using kline data."""
+    hist = get_kline_series(klines, date, lookback=3)
+    if hist is None or len(hist) < 2:
+        return False
+    today_close = hist[-1]["close"]
+    yest_close = hist[-2]["close"]
+    if yest_close <= 0:
+        return False
+    limit_pct = get_limit_pct(code)
+    return today_close >= yest_close * (1 + limit_pct) * 0.995
+
+def is_limit_down_from_klines(klines: list[dict], date: str, code: str) -> bool:
+    """Check if the stock was at 跌停 on the given date, using kline data."""
+    hist = get_kline_series(klines, date, lookback=3)
+    if hist is None or len(hist) < 2:
+        return False
+    today_close = hist[-1]["close"]
+    yest_close = hist[-2]["close"]
+    if yest_close <= 0:
+        return False
+    limit_pct = get_limit_pct(code)
+    return today_close <= yest_close * (1 - limit_pct) * 1.005
 
 
 def is_st(name: str) -> bool:
@@ -185,7 +223,7 @@ class BacktestResult:
 # ── K-line helpers ────────────────────────────────────────────────
 
 def fetch_kline_with_dates(sym: str, config: dict) -> list[dict] | None:
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,500,qfq"
+    url = f"https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,500,qfq"
     headers = {**TENCENT_HEADERS, "Referer": "https://gu.qq.com"}
     for attempt in range(2):
         raw = fetch_url(url, headers=headers, timeout=config.get("timeout_kline", 10))
@@ -462,7 +500,8 @@ class MomentumMABacktester:
           1. price < buy_price × 0.94 → sell all (hard stop loss)
           2. price < MA18 → sell all (hard stop)
           3. price > MA5 × 1.3 → sell half (take profit)
-          4. price < MA5 → sell half (trailing stop)
+          4. peak_price >= buy_price × 1.08 → sell half (peak TP, ~60%)
+          5. price < MA5 → sell half (trailing stop)
         """
         hist = get_kline_series(klines, current_date, lookback=60)
         if hist is None or len(hist) < 25:
@@ -479,6 +518,10 @@ class MomentumMABacktester:
 
         buy_price = position.buy_price
 
+        # ── Check if stock is at 跌停 (cannot sell) ──
+        if is_limit_down_from_klines(klines, current_date, position.code):
+            return False
+
         # Priority 1: Price < 94% of buy price → sell all (hard stop loss)
         stoploss_price = buy_price * self.cfg.get("stoploss_pct", 0.94)
         if close <= stoploss_price:
@@ -490,12 +533,21 @@ class MomentumMABacktester:
             position.sell_all(current_date, close, "MA18_below")
             return True
 
-        # Priority 3: Half-sell conditions (only if still has 2 units)
+        # ── Half-sell conditions (only if still has 2 units) ──
         if position.units >= 2:
+            # Priority 3: Price > MA5 × 1.3 → sell half (take profit)
             tp_price = ma5 * self.cfg["take_profit_mult"]
             if close > tp_price:
                 position.sell_half(current_date, close, "TP_MA5x1.3")
                 return False  # still has the other half
+
+            # Priority 4: Latest kline high >= close × 1.08 → sell half (long upper shadow)
+            kline_high = hist[-1].get("high", close)
+            if kline_high >= close * PEAK_TP_PCT:
+                position.sell_half(current_date, close, "UPPER_SHADOW_1.08x")
+                return False
+
+            # Priority 5: Price < MA5 → sell half (trailing stop)
             if close < ma5:
                 position.sell_half(current_date, close, "SL_below_MA5")
                 return False  # still has the other half
@@ -511,25 +563,26 @@ class MomentumMABacktester:
             log("ERROR: Empty universe, cannot backtest.")
             return result
 
-        # 2. Fetch klines
+        # 1b. Fetch CSI All-Share index klines FIRST (before stock klines, to avoid API rate limiting)
+        idx_sym = "sh000985"
+        idx_klines = fetch_kline_with_dates(idx_sym, self.cfg)
+        index_code = "sh000985"
+        idx_prefix = "sh"
+        if idx_klines and len(idx_klines) >= 60:
+            log(f"  Index klines (sh000985): {len(idx_klines)} days, {idx_klines[0]['date']} ~ {idx_klines[-1]['date']}")
+        else:
+            log("  WARN: No index klines, market filter disabled")
+            idx_prefix = None
+
+        # 2. Fetch stock klines
         klines_data = self.fetch_klines(universe)
         if not klines_data:
             log("ERROR: No kline data, cannot backtest.")
             return result
 
-        # 2b. Fetch CSI All-Share index klines for market state
-        index_code = "399985"
-        idx_prefix = code_to_prefix(index_code)
-        if idx_prefix:
-            idx_sym = f"{idx_prefix}{index_code}"
-            idx_klines = fetch_kline_with_dates(idx_sym, self.cfg)
-            if idx_klines and len(idx_klines) >= 60:
-                klines_data[index_code] = idx_klines
-                log(f"  Index klines (399985): {len(idx_klines)} days")
-            else:
-                log("  WARN: No index klines, market filter disabled")
-        else:
-            log("  WARN: Invalid index code, market filter disabled")
+        # Store index klines in the same dict (won't conflict with stock codes)
+        if idx_klines and len(idx_klines) >= 60:
+            klines_data[index_code] = idx_klines
 
         # 3. Build date axis
         all_dates = build_common_dates(klines_data)
@@ -542,8 +595,16 @@ class MomentumMABacktester:
         backtest_days = self.cfg["backtest_days"]
         if backtest_days >= len(all_dates):
             backtest_days = len(all_dates) // 2
-        start_idx = len(all_dates) - backtest_days
-        backtest_dates = all_dates[start_idx:]
+        
+        # Support both "early" (oldest data) and "late" (most recent data) modes
+        backtest_mode = self.cfg.get("backtest_mode", "late")
+        if backtest_mode == "early":
+            # Use the oldest data (first N days)
+            backtest_dates = all_dates[:backtest_days]
+        else:
+            # Use the most recent data (last N days, default)
+            start_idx = len(all_dates) - backtest_days
+            backtest_dates = all_dates[start_idx:]
 
         rebalance_freq = self.cfg["rebalance_freq_days"]
         rebalance_indices = list(range(0, len(backtest_dates), rebalance_freq))
@@ -576,7 +637,7 @@ class MomentumMABacktester:
 
         for ri, buy_date in enumerate(rebalance_dates):
             # ── Market filter: skip rebalance in bear market ────────
-            if idx_prefix and is_bear_market(buy_date):
+            if not self.cfg.get("no_market_filter", False) and idx_prefix and is_bear_market(buy_date):
                 log(f"  [SKIP] {buy_date}: bear market (index < MA20)")
                 skipped_rebalances += 1
                 continue
@@ -587,6 +648,11 @@ class MomentumMABacktester:
                 log(f"  [BUY] {buy_date}: {len(picks)} picks")
                 for pick in picks:
                     code = pick["code"]
+                    # ── Skip if stock is at 涨停 on buy date ──
+                    klines = klines_data.get(code)
+                    if klines and is_limit_up_from_klines(klines, buy_date, code):
+                        log(f"    [SKIP] {code} at 涨停 on {buy_date}, skipping buy")
+                        continue
                     pos = Position(
                         code=code, buy_date=buy_date,
                         buy_price=pick["close"],
@@ -596,6 +662,7 @@ class MomentumMABacktester:
                     open_positions.append(pos)
 
             # ── Daily sell checks for all open positions ────────────
+            # A股 T+1: sell checks start from buy_date + 1 (next trading day)
             buy_idx = date_to_idx.get(buy_date, 0)
             for di in range(buy_idx + 1, len(backtest_dates)):
                 current_date = backtest_dates[di]
@@ -663,6 +730,12 @@ def main():
                         help="Take profit multiplier (price > MA5 * N)")
     parser.add_argument("--save", "-s", action="store_true",
                         help="Save results to JSON")
+    parser.add_argument("--output", "-o", type=str, default=None,
+                        help="Output filename (default: momentum_ma_backtest.json)")
+    parser.add_argument("--early", action="store_true",
+                        help="Use earliest data instead of most recent")
+    parser.add_argument("--no-market-filter", action="store_true",
+                        help="Disable bear market skip filter")
     args = parser.parse_args()
 
     bt_config = {
@@ -674,6 +747,10 @@ def main():
         "stoploss_pct": args.stoploss,
         "take_profit_mult": args.tp,
     }
+    if args.early:
+        bt_config["backtest_mode"] = "early"
+    if args.no_market_filter:
+        bt_config["no_market_filter"] = True
 
     bt = MomentumMABacktester(bt_config)
     t0 = time.time()
@@ -686,7 +763,8 @@ def main():
     if args.save:
         output_dir = os.path.join(PROJECT_DIR, "backtest_results")
         os.makedirs(output_dir, exist_ok=True)
-        path = os.path.join(output_dir, "momentum_ma_backtest.json")
+        fname = args.output if args.output else "momentum_ma_backtest.json"
+        path = os.path.join(output_dir, fname)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(result.to_dict(), f, ensure_ascii=False, indent=2)
         print(f"Results saved to {path}")

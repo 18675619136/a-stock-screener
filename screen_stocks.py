@@ -155,7 +155,7 @@ def fetch_kline(code, days=30):
     else:
         return None
     
-    url = f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{code},day,,,{days},qfq'
+    url = f'https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{code},day,,,{days},qfq'
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://gu.qq.com'})
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:

@@ -117,7 +117,7 @@ for i, c in enumerate(check_candidates):
     elif code.startswith(('8','4')): pref = 'bj'
     else: continue
     
-    url = f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={pref}{code},day,,,30,qfq'
+    url = f'https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={pref}{code},day,,,30,qfq'
     try:
         req = urllib.request.Request(url, headers=TENCENT_HEADERS)
         with urllib.request.urlopen(req, timeout=10) as r:

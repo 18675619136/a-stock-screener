@@ -105,22 +105,19 @@ class MomentumMAStrategy(StrategyBase):
         # Skip if backtest mode (market filter handled by the backtest engine)
         if not cfg.get("skip_market_check", False):
             try:
-                index_code = "399985"
-                idx_prefix = code_to_prefix(index_code)
-                if idx_prefix:
-                    idx_sym = f"{idx_prefix}{index_code}"
-                    mkt_fetcher = DataFetcher(context.engine_config)
-                    idx_kd = mkt_fetcher.get_kline(idx_sym)
-                    if idx_kd and len(idx_kd) >= 25:
-                        idx_closes = [d["close"] for d in idx_kd]
-                        idx_close = idx_closes[-1]
-                        idx_ma20 = sum(idx_closes[-20:]) / 20
-                        above_pct = (idx_close - idx_ma20) / idx_ma20 * 100
-                        market_bear = idx_close < idx_ma20
-                        log(f"  Market: CSI All-Share={idx_close:.0f}, MA20={idx_ma20:.0f}, "
-                            f"{'BEAR' if market_bear else 'BULL'} (+{above_pct:.1f}% above MA20)"
-                            if above_pct > 0 else
-                            f"{'BEAR' if market_bear else 'BULL'} ({above_pct:.1f}% below MA20)")
+                idx_sym = "sh000985"
+                mkt_fetcher = DataFetcher(context.engine_config)
+                idx_kd = mkt_fetcher.get_kline(idx_sym)
+                if idx_kd and len(idx_kd) >= 25:
+                    idx_closes = [d["close"] for d in idx_kd]
+                    idx_close = idx_closes[-1]
+                    idx_ma20 = sum(idx_closes[-20:]) / 20
+                    above_pct = (idx_close - idx_ma20) / idx_ma20 * 100
+                    market_bear = idx_close < idx_ma20
+                    log(f"  Market: CSI All-Share={idx_close:.0f}, MA20={idx_ma20:.0f}, "
+                        f"{'BEAR' if market_bear else 'BULL'} (+{above_pct:.1f}% above MA20)"
+                        if above_pct > 0 else
+                        f"{'BEAR' if market_bear else 'BULL'} ({above_pct:.1f}% below MA20)")
             except Exception as e:
                 log(f"  Market check skipped: {e}")
 

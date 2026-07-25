@@ -41,9 +41,9 @@ DEFAULT_CONFIG = {
     "max_mv": 1000,
     "min_total_shares": 0.5,
     "max_total_shares": 10,
-    "ma_short": 10,
-    "ma_long": 30,
-    "ma_stop": 30,       # MA for hard stop (MA30)
+    "ma_short": 5,
+    "ma_long": 18,
+    "ma_stop": 10,       # MA for hard stop (MA10 — 买入看MA18金叉, 清仓看MA10)
     "gc_lookback_days": 3,  # golden cross within last N days
     "top_n": 30,
     "take_profit_mult": 1.3,   # price > MA5 * 1.3 → sell half
@@ -52,7 +52,42 @@ DEFAULT_CONFIG = {
 }
 
 COST = 0.001
+PEAK_TP_PCT = 1.15
 ST_NAME_PREFIXES = ("ST", "*ST", "S")
+
+# ── 涨停/跌停辅助函数 ──
+def get_limit_pct(code: str) -> float:
+    """返回涨跌幅限制比例"""
+    if code.startswith(("300", "688")):
+        return 0.20  # 创业板/科创板 20%
+    elif code.startswith(("8", "4", "92")):
+        return 0.30  # 北交所 30%
+    else:
+        return 0.10  # 主板 10%
+
+def is_limit_up_from_klines(klines: list[dict], date: str, code: str) -> bool:
+    """Check if the stock was at 涨停 on the given date, using kline data."""
+    hist = get_kline_series(klines, date, lookback=3)
+    if hist is None or len(hist) < 2:
+        return False
+    today_close = hist[-1]["close"]
+    yest_close = hist[-2]["close"]
+    if yest_close <= 0:
+        return False
+    limit_pct = get_limit_pct(code)
+    return today_close >= yest_close * (1 + limit_pct) * 0.995
+
+def is_limit_down_from_klines(klines: list[dict], date: str, code: str) -> bool:
+    """Check if the stock was at 跌停 on the given date, using kline data."""
+    hist = get_kline_series(klines, date, lookback=3)
+    if hist is None or len(hist) < 2:
+        return False
+    today_close = hist[-1]["close"]
+    yest_close = hist[-2]["close"]
+    if yest_close <= 0:
+        return False
+    limit_pct = get_limit_pct(code)
+    return today_close <= yest_close * (1 - limit_pct) * 1.005
 
 
 def is_st(name: str) -> bool:
@@ -181,7 +216,7 @@ class BacktestResult:
 # ── K-line helpers (same as before) ────────────────────────────────
 
 def fetch_kline_with_dates(sym: str, config: dict) -> list[dict] | None:
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,500,qfq"
+    url = f"https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,500,qfq"
     headers = {**TENCENT_HEADERS, "Referer": "https://gu.qq.com"}
     for attempt in range(2):
         raw = fetch_url(url, headers=headers, timeout=config.get("timeout_kline", 10))
@@ -468,6 +503,10 @@ class DualMAGoldenCrossBacktester:
 
         buy_price = position.buy_price
 
+        # ── Check if stock is at 跌停 (cannot sell) ──
+        if is_limit_down_from_klines(klines, current_date, position.code):
+            return False
+
         # Priority 1: Price < 94% of buy price → sell all (hard stop loss)
         stoploss_price = buy_price * self.cfg.get("stoploss_pct", 0.94)
         if close <= stoploss_price:
@@ -500,25 +539,26 @@ class DualMAGoldenCrossBacktester:
             log("ERROR: Empty universe, cannot backtest.")
             return result
 
-        # 2. Fetch klines
+        # 1b. Fetch CSI All-Share index klines FIRST (before stock klines, to avoid API rate limiting)
+        idx_sym = "sh000985"
+        idx_klines = fetch_kline_with_dates(idx_sym, self.cfg)
+        index_code = "sh000985"
+        idx_prefix = "sh"
+        if idx_klines and len(idx_klines) >= 60:
+            log(f"  Index klines (sh000985): {len(idx_klines)} days, {idx_klines[0]['date']} ~ {idx_klines[-1]['date']}")
+        else:
+            log("  WARN: No index klines, market filter disabled")
+            idx_prefix = None
+
+        # 2. Fetch stock klines
         klines_data = self.fetch_klines(universe)
         if not klines_data:
             log("ERROR: No kline data, cannot backtest.")
             return result
 
-        # 2b. Fetch CSI All-Share index klines for market state
-        index_code = "399985"
-        idx_prefix = code_to_prefix(index_code)
-        if idx_prefix:
-            idx_sym = f"{idx_prefix}{index_code}"
-            idx_klines = fetch_kline_with_dates(idx_sym, self.cfg)
-            if idx_klines and len(idx_klines) >= 60:
-                klines_data[index_code] = idx_klines
-                log(f"  Index klines (399985): {len(idx_klines)} days")
-            else:
-                log("  WARN: No index klines, market filter disabled")
-        else:
-            log("  WARN: Invalid index code, market filter disabled")
+        # Store index klines in the same dict (won't conflict with stock codes)
+        if idx_klines and len(idx_klines) >= 60:
+            klines_data[index_code] = idx_klines
 
         # 3. Build date axis
         all_dates = build_common_dates(klines_data)
@@ -564,7 +604,7 @@ class DualMAGoldenCrossBacktester:
 
         for ri, buy_date in enumerate(rebalance_dates):
             # ── Market filter: skip rebalance in bear market ────────
-            if idx_prefix and is_bear_market(buy_date):
+            if not self.cfg.get("no_market_filter", False) and idx_prefix and is_bear_market(buy_date):
                 log(f"  [SKIP] {buy_date}: bear market (index < MA20)")
                 skipped_rebalances += 1
                 continue
@@ -575,6 +615,11 @@ class DualMAGoldenCrossBacktester:
                 log(f"  [BUY] {buy_date}: {len(picks)} picks")
                 for pick in picks:
                     code = pick["code"]
+                    # ── Skip if stock is at 涨停 on buy date ──
+                    klines = klines_data.get(code)
+                    if klines and is_limit_up_from_klines(klines, buy_date, code):
+                        log(f"    [SKIP] {code} at 涨停 on {buy_date}, skipping buy")
+                        continue
                     pos = Position(
                         code=code, buy_date=buy_date,
                         buy_price=pick["close"],
@@ -653,6 +698,8 @@ def main():
                         help="Hard stop loss as fraction of buy price")
     parser.add_argument("--save", "-s", action="store_true",
                         help="Save results to JSON")
+    parser.add_argument("--no-market-filter", action="store_true",
+                        help="Disable bear market skip filter")
     args = parser.parse_args()
 
     bt_config = {
@@ -664,6 +711,8 @@ def main():
         "take_profit_mult": args.tp,
         "stoploss_pct": args.stoploss,
     }
+    if args.no_market_filter:
+        bt_config["no_market_filter"] = True
 
     bt = DualMAGoldenCrossBacktester(bt_config)
     t0 = time.time()
