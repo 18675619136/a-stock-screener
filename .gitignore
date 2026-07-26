@@ -15,3 +15,4 @@ strategy_result.json
 
 # Debug
 debug_tencent.py
+backtest_etf_result_*.json
