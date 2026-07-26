@@ -62,7 +62,7 @@ def calc_ma(closes: list[float], period: int) -> list[float]:
 
 def fetch_etf_klines(sym: str, max_days: int = 500) -> list[dict] | None:
     """获取ETF K线数据（含date字段）"""
-    url = f"https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,500,qfq"
+    url = f"https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={sym},day,,,{max_days},qfq"
     for attempt in range(3):
         raw = fetch_url(url, headers=TENCENT_HEADERS, timeout=15)
         if not raw or len(raw) < 50:
@@ -409,6 +409,8 @@ def main():
     parser = argparse.ArgumentParser(description="ETF MA5/18 金叉策略回测")
     parser.add_argument("--days", type=int, default=500, help="最大K线天数")
     parser.add_argument("--capital", type=float, default=INITIAL_CAPITAL, help="每只ETF初始资金")
+    parser.add_argument("--start-date", type=str, default="", help="回测开始日期 (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, default="", help="回测结束日期 (YYYY-MM-DD)")
     args = parser.parse_args()
 
     results = []
@@ -422,7 +424,19 @@ def main():
             continue
 
         print(f"  ✅ 获取到 {len(klines)} 根K线 ({klines[0]['date']} ~ {klines[-1]['date']})", file=sys.stderr)
-        time.sleep(0.5)  # API限流
+        time.sleep(0.5)
+
+        # 按日期范围过滤
+        if args.start_date:
+            klines = [k for k in klines if k["date"] >= args.start_date]
+        if args.end_date:
+            klines = [k for k in klines if k["date"] <= args.end_date]
+
+        if len(klines) < 25:
+            print(f"  ❌ {name}({sym}) 日期范围内K线不足 ({len(klines)}根)，跳过", file=sys.stderr)
+            continue
+
+        print(f"  📅 回测区间: {klines[0]['date']} ~ {klines[-1]['date']} ({len(klines)}根K线)", file=sys.stderr)  # API限流
 
         result = run_backtest(etf, klines, capital=args.capital)
         results.append(result)
