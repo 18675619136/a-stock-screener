@@ -19,6 +19,8 @@ MODE = sys.argv[2] if len(sys.argv) > 2 else "leg"
 W0, W1 = (sys.argv[3], sys.argv[4]) if len(sys.argv) > 4 else ("2024-09-20", "2026-09-11")
 FEE = float(sys.argv[5]) if len(sys.argv) > 5 else 0.005
 BUF = float(sys.argv[6]) if len(sys.argv) > 6 else 0.0
+MF = (sys.argv[7].lower() in ("1", "on", "true", "yes")) if len(sys.argv) > 7 else False
+HS = float(sys.argv[8]) if len(sys.argv) > 8 else 0.0
 
 cfg = dict(universe_size=800, days=9999, kline_days=800, turn_lookback=15, band=0.03,
            rally_thresh=0.08, rally_mode=MODE, capital=150000, slots=3, fee=FEE,
@@ -29,6 +31,8 @@ mkt = m.load_or_build_cache(cfg)
 nm = {s["code"]: s.get("name", s["code"]) for s in mkt["universe"]}
 
 rets, holds, reasons = [], [], Counter()
+bear_days = m.load_index_bear_days(cfg) if MF else set()
+skipped_mf = 0
 for code, bars in mkt["klines"].items():
     s = m.compute_signals(code, bars, cfg)
     dates, d2i = s["dates"], None
@@ -37,6 +41,9 @@ for code, bars in mkt["klines"].items():
     for sd in s["signals"]:
         if not (W0 <= sd <= W1):
             continue
+        if MF and sd in bear_days:
+            skipped_mf += 1
+            continue
         i0 = d2i[sd]
         buy = closes[i0]
         armed = ma5[i0] > 0 and buy >= ma5[i0]
@@ -44,6 +51,9 @@ for code, bars in mkt["klines"].items():
         exit_i = None
         for i in range(i0 + 1, len(closes)):        # T+1
             c = closes[i]
+            if HS > 0 and c <= buy * (1 - HS):       # 硬止损优先
+                exit_i = i
+                break
             if ma20[i] > 0 and c < ma20[i] * (1 - BUF):
                 exit_i = i
                 break
@@ -71,7 +81,8 @@ wins = [r for r in rets if r > 0]
 losses = [r for r in rets if r <= 0]
 print("=" * 74)
 print(f"  全部信号等权模拟  rally={MODE}  手续费={FEE*100:.2f}%(单边)  窗口 {W0}→{W1}")
-print(f"  入场容差={BUF*100:.0f}%   信号总数={n}")
+print(f"  入场容差={BUF*100:.0f}%   硬止损={HS*100:.0f}%   大盘择时={'on' if MF else 'off'}"
+      f"   信号总数={n}" + (f" (择时跳过 {skipped_mf})" if MF else ""))
 print("=" * 74)
 print(f"  平均收益/笔       {sum(rets)/n:+.2f}%")
 print(f"  中位收益/笔       {rets_s[n//2]:+.2f}%")

@@ -272,6 +272,48 @@ def load_or_build_cache(cfg: dict) -> dict:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  大盘择时：指数收盘 < MA18 的日子禁止开新仓
+# ══════════════════════════════════════════════════════════════════
+
+def load_index_bear_days(cfg: dict) -> set:
+    """返回"大盘走弱"的交易日集合（指数收盘 < MA18）。
+
+    指数源: TDX index_kline(sh000300, 800根 ≈ 3.2年, 无封禁)
+            → 腾讯 sh000985 / sh000300（更长历史, 可能被限流）
+    ⚠️ TDX 指数库无中证全指 000985，故主用沪深300；两者择时信号高度一致。
+    """
+    bars, used = None, None
+    if TDX is not None:
+        for sym in ("sh000300", "sh000001"):
+            try:
+                b = TDX.index_kline(sym, 800)
+            except Exception:
+                b = None
+            if b and len(b) >= 60:
+                bars, used = b, f"tdx:{sym}"
+                break
+    if bars is None:
+        for sym in ("sh000985", "sh000300"):
+            try:
+                b = tencent_one_kline(sym, 1000)
+            except Exception:
+                b = None
+            if b and len(b) >= 60:
+                bars, used = b, f"tencent:{sym}"
+                break
+    if bars is None:
+        log("  WARN: 无法获取指数K线, 大盘择时不可用")
+        return set()
+    log(f"  大盘择时指数: {used}, {len(bars)} 根, {bars[0]['date']} ~ {bars[-1]['date']}")
+    closes = [b["close"] for b in bars]
+    ma18 = moving_average(closes, 18)
+    bear = {bars[i]["date"] for i in range(len(bars))
+            if ma18[i] > 0 and closes[i] < ma18[i]}
+    log(f"  大盘走弱(指数<MA18)交易日: {len(bear)}/{len(bars)} ({len(bear)*100//len(bars)}%)")
+    return bear
+
+
+# ══════════════════════════════════════════════════════════════════
 #  信号引擎：为每只股票预计算全部买入信号日
 # ══════════════════════════════════════════════════════════════════
 
@@ -390,6 +432,8 @@ def run_portfolio(sig_map: dict[str, dict], cfg: dict) -> dict[str, Any]:
     skipped_no_cash = 0
     skipped_no_slot = 0
     skipped_held = 0
+    skipped_market = 0
+    bear_days = cfg.get("index_bear_days") or set()
 
     nav_series: list[float] = []
     nav_dates: list[str] = []
@@ -419,6 +463,12 @@ def run_portfolio(sig_map: dict[str, dict], cfg: dict) -> dict[str, Any]:
             if ma5 > 0 and close >= ma5:
                 p.armed = True
 
+            # (0) 硬止损（优先级最高；hard_stop=0 表示关闭）
+            hs = cfg.get("hard_stop", 0.0)
+            if hs > 0 and close <= p.buy_price * (1 - hs):
+                trades.append(_mk_trade(p, date, close, p.shares, "SL_hard", fee))
+                cash += p.shares * close * (1 - fee)
+                continue
             # (b) 跌破 MA20 → 全部卖出（最终退出，优先级高于卖半）
             if ma20 > 0 and close < ma20 * (1 - cfg.get("ma20_buffer", 0.0)):
                 trades.append(_mk_trade(p, date, close, p.shares, "MA20_break", fee))
@@ -450,6 +500,9 @@ def run_portfolio(sig_map: dict[str, dict], cfg: dict) -> dict[str, Any]:
                 continue
             if len(positions) >= slots:
                 skipped_no_slot += 1
+                continue
+            if cfg.get("market_filter") and date in bear_days:
+                skipped_market += 1
                 continue
             i = s["d2i"][date]
             bar = s["bars"][i]
@@ -498,7 +551,8 @@ def run_portfolio(sig_map: dict[str, dict], cfg: dict) -> dict[str, Any]:
         "trades": trades, "nav_series": nav_series, "nav_dates": nav_dates,
         "final_cash": cash, "signal_hits": signal_hits, "n_buys": n_buys,
         "skipped_no_slot": skipped_no_slot, "skipped_no_cash": skipped_no_cash,
-        "skipped_held": skipped_held, "win_dates": win_dates,
+        "skipped_held": skipped_held, "skipped_market": skipped_market,
+        "win_dates": win_dates,
         "initial": capital,
     }
 
@@ -584,9 +638,10 @@ def summarize(res: dict[str, Any], cfg: dict, sig_map: dict[str, dict]) -> dict:
     total_signals = sum(len(s["signals"]) for s in sig_map.values())
 
     # ── 基准：候选池等权买入持有（区间内 close_end/close_start 均值）──
+    #    ⚠️ 不要用 s["d2i"]: 那是 run_portfolio() 注入的中间态, summarize() 不应依赖它
     bm_rets = []
     for code, s in sig_map.items():
-        d2i = s["d2i"]
+        d2i = {d: i for i, d in enumerate(s["dates"])}
         first, last = None, None
         for d in res["win_dates"]:
             if d in d2i:
@@ -614,6 +669,7 @@ def summarize(res: dict[str, Any], cfg: dict, sig_map: dict[str, dict]) -> dict:
         "skipped_no_slot": res["skipped_no_slot"],
         "skipped_no_cash": res["skipped_no_cash"],
         "skipped_already_held": res["skipped_held"],
+        "skipped_market_timing": res.get("skipped_market", 0),
         # ── 仓位级（策略 edge，资金无关） ──
         "positions_closed": npos,
         "pos_win_rate_pct": round(len(pos_wins) / npos * 100, 2) if npos else 0.0,
@@ -664,6 +720,10 @@ def main():
                     help="跌破 MA20 的容差（0=你的原始规则：close<MA20 即清仓）")
     ap.add_argument("--rally-thresh", type=float, default=0.08)
     ap.add_argument("--rally-mode", choices=["single", "leg"], default="single")
+    ap.add_argument("--market-filter", action="store_true",
+                    help="大盘(沪深300)收盘 < MA18 时禁止开新仓")
+    ap.add_argument("--hard-stop", type=float, default=0.0,
+                    help="硬止损比例, 如 0.08 = 跌破买入价8%% 全卖 (0=关闭)")
     ap.add_argument("--no-arm", action="store_true",
                     help="卖半不要求价格先站上MA5（买入后首次 close<=MA5 即卖半）")
     ap.add_argument("--capital", type=float, default=150000)
@@ -690,6 +750,7 @@ def main():
         "rally_mode": args.rally_mode, "capital": args.capital,
         "slots": args.slots, "fee": args.fee, "max_mv": args.max_mv,
         "require_arm": not args.no_arm,
+        "market_filter": args.market_filter, "hard_stop": args.hard_stop,
         "min_total_shares": args.min_total_shares,
         "max_total_shares": args.max_total_shares,
         "fallback_limit": args.fallback_limit, "cache": args.cache,
@@ -711,6 +772,9 @@ def main():
     log(f"  信号股票数 {sum(1 for s in sig_map.values() if s['signals'])}"
         f" / {len(sig_map)}")
 
+    if cfg.get("market_filter"):
+        cfg["index_bear_days"] = load_index_bear_days(cfg)
+
     res = run_portfolio(sig_map, cfg)
     out = summarize(res, cfg, sig_map)
     out["elapsed_s"] = round(time.time() - t0, 1)
@@ -719,10 +783,12 @@ def main():
     print("\n" + "=" * 72)
     print(f"  MA20转升 + >{cfg['rally_thresh']*100:.0f}点上涨({cfg['rally_mode']}) "
           f"+ 回踩MA20  |  卖半={'armed' if cfg.get('require_arm', True) else 'immediate'}"
-          f"  |  MA20止损容差={cfg.get('ma20_buffer', 0.0)*100:.0f}%")
+          f"  |  MA20容差={cfg.get('ma20_buffer', 0.0)*100:.0f}%"
+          f"  |  择时={'on' if cfg.get('market_filter') else 'off'}"
+          f"  |  硬止损={cfg.get('hard_stop', 0.0)*100:.0f}%")
     print("=" * 72)
     for k in ("period", "universe_size", "signal_hits_in_window", "buys_executed",
-              "skipped_no_slot", "skipped_already_held",
+              "skipped_no_slot", "skipped_already_held", "skipped_market_timing",
               "positions_closed", "pos_win_rate_pct", "pos_avg_return_pct",
               "pos_median_return_pct", "pos_avg_win_pct", "pos_avg_loss_pct",
               "pos_profit_factor", "pos_avg_holding_days",
